@@ -34,6 +34,7 @@ import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.core.common.io.stream.NotSerializableExceptionWrapper;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.settings.SettingsException;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.index.engine.DocumentMissingException;
@@ -43,6 +44,7 @@ import org.opensearch.index.reindex.DeleteByQueryRequest;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.script.Script;
 import org.opensearch.script.ScriptType;
+import org.opensearch.search.asynchronous.plugin.AsynchronousSearchPlugin;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -82,11 +84,19 @@ public class AsynchronousSearchPersistenceService {
     private final Client client;
     private final ClusterService clusterService;
     private final ThreadPool threadPool;
+    private volatile boolean standbyModeEnabled;
 
     public AsynchronousSearchPersistenceService(Client client, ClusterService clusterService, ThreadPool threadPool) {
         this.client = client;
         this.clusterService = clusterService;
         this.threadPool = threadPool;
+        this.standbyModeEnabled = AsynchronousSearchPlugin.CLUSTER_STANDBY_MODE_SETTING.get(clusterService.getSettings());
+        try {
+            clusterService.getClusterSettings()
+                .addSettingsUpdateConsumer(AsynchronousSearchPlugin.CLUSTER_STANDBY_MODE_SETTING, this::setStandbyModeEnabled);
+        } catch (SettingsException e) {
+            logger.trace("cluster standby mode setting is not registered with cluster settings", e);
+        }
     }
 
     /**
@@ -98,6 +108,13 @@ public class AsynchronousSearchPersistenceService {
      * @param listener         actionListener to invoke with indexResponse
      */
     public void storeResponse(String id, AsynchronousSearchPersistenceModel persistenceModel, ActionListener<IndexResponse> listener) {
+        if (standbyModeEnabled) {
+            logger.debug("cluster standby mode is enabled, skipping asynchronous search response storage [{}]", id);
+            listener.onFailure(
+                new IllegalStateException("cluster standby mode is enabled, asynchronous search response storage is disabled")
+            );
+            return;
+        }
         if (indexExists()) {
             doStoreResult(id, persistenceModel, listener);
         } else {
@@ -160,6 +177,13 @@ public class AsynchronousSearchPersistenceService {
      */
 
     public void deleteResponse(String id, User user, ActionListener<Boolean> listener) {
+        if (standbyModeEnabled) {
+            logger.debug("cluster standby mode is enabled, skipping asynchronous search response delete [{}]", id);
+            listener.onFailure(
+                new IllegalStateException("cluster standby mode is enabled, asynchronous search response deletion is disabled")
+            );
+            return;
+        }
         if (indexExists() == false) {
             logger.debug("Async search index [{}] doesn't exists", ASYNC_SEARCH_RESPONSE_INDEX);
             listener.onFailure(new ResourceNotFoundException(id));
@@ -235,6 +259,13 @@ public class AsynchronousSearchPersistenceService {
         User user,
         ActionListener<AsynchronousSearchPersistenceModel> listener
     ) {
+        if (standbyModeEnabled) {
+            logger.debug("cluster standby mode is enabled, skipping asynchronous search expiration update [{}]", id);
+            listener.onFailure(
+                new IllegalStateException("cluster standby mode is enabled, asynchronous search expiration updates are disabled")
+            );
+            return;
+        }
         if (indexExists() == false) {
             listener.onFailure(new ResourceNotFoundException(id));
             return;
@@ -324,6 +355,14 @@ public class AsynchronousSearchPersistenceService {
      * @param expirationTimeInMillis the expiration time
      */
     public void deleteExpiredResponses(ActionListener<AcknowledgedResponse> listener, long expirationTimeInMillis) {
+        if (standbyModeEnabled) {
+            logger.debug(
+                "cluster standby mode is enabled, skipping expired asynchronous search response cleanup for expiration time [{}]",
+                expirationTimeInMillis
+            );
+            listener.onResponse(new AcknowledgedResponse(true));
+            return;
+        }
         if (indexExists() == false) {
             logger.debug("Async search index not yet created! Nothing to delete.");
             listener.onResponse(new AcknowledgedResponse(true));
@@ -471,5 +510,14 @@ public class AsynchronousSearchPersistenceService {
 
     private boolean indexExists() {
         return clusterService.state().routingTable().hasIndex(ASYNC_SEARCH_RESPONSE_INDEX);
+    }
+
+    public boolean isStandbyModeEnabled() {
+        return standbyModeEnabled;
+    }
+
+    private void setStandbyModeEnabled(boolean standbyModeEnabled) {
+        logger.debug("updating cluster standby mode for asynchronous search persistence service to [{}]", standbyModeEnabled);
+        this.standbyModeEnabled = standbyModeEnabled;
     }
 }

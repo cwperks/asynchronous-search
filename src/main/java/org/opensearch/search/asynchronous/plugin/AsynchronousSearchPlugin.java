@@ -69,6 +69,13 @@ public class AsynchronousSearchPlugin extends Plugin implements ActionPlugin, Sy
     public static final String OPEN_DISTRO_ASYNC_SEARCH_GENERIC_THREAD_POOL_NAME = "opensearch_asynchronous_search_generic";
     public static final String LEGACY_OPENDISTRO_BASE_URI = "/_opendistro/_asynchronous_search";
     public static final String BASE_URI = "/_plugins/_asynchronous_search";
+    public static final Setting<Boolean> CLUSTER_STANDBY_MODE_SETTING = Setting.boolSetting(
+        "cluster.standby_mode",
+        false,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic,
+        Setting.Property.Sensitive
+    );
 
     private AsynchronousSearchPersistenceService persistenceService;
     private AsynchronousSearchActiveStore asynchronousSearchActiveStore;
@@ -146,6 +153,7 @@ public class AsynchronousSearchPlugin extends Plugin implements ActionPlugin, Sy
     @Override
     public List<Setting<?>> getSettings() {
         return Arrays.asList(
+            CLUSTER_STANDBY_MODE_SETTING,
             AsynchronousSearchActiveStore.NODE_CONCURRENT_RUNNING_SEARCHES_SETTING,
             AsynchronousSearchService.MAX_KEEP_ALIVE_SETTING,
             AsynchronousSearchService.MAX_SEARCH_RUNNING_TIME_SETTING,

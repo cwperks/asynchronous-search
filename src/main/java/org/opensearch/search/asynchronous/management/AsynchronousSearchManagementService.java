@@ -33,6 +33,7 @@ import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.settings.SettingsException;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.AbstractRunnable;
 import org.opensearch.common.util.concurrent.ThreadContext;
@@ -74,6 +75,7 @@ public class AsynchronousSearchManagementService extends AbstractLifecycleCompon
     private TransportService transportService;
     private TimeValue activeContextReaperInterval;
     private TimeValue persistedResponseCleanUpInterval;
+    private volatile boolean standbyModeEnabled;
 
     public static final String PERSISTED_RESPONSE_CLEANUP_ACTION_NAME = "indices:data/read/opendistro/asynchronous_search/response_cleanup";
 
@@ -107,6 +109,15 @@ public class AsynchronousSearchManagementService extends AbstractLifecycleCompon
         this.asynchronousSearchPersistenceService = asynchronousSearchPersistenceService;
         this.activeContextReaperInterval = ACTIVE_CONTEXT_REAPER_INTERVAL_SETTING.get(settings);
         this.persistedResponseCleanUpInterval = PERSISTED_RESPONSE_CLEAN_UP_INTERVAL_SETTING.get(settings);
+        this.standbyModeEnabled = AsynchronousSearchPlugin.CLUSTER_STANDBY_MODE_SETTING.get(settings);
+        if (clusterService.getClusterSettings() != null) {
+            try {
+                clusterService.getClusterSettings()
+                    .addSettingsUpdateConsumer(AsynchronousSearchPlugin.CLUSTER_STANDBY_MODE_SETTING, this::setStandbyModeEnabled);
+            } catch (SettingsException e) {
+                logger.trace("cluster standby mode setting is not registered with cluster settings", e);
+            }
+        }
 
         transportService.registerRequestHandler(
             PERSISTED_RESPONSE_CLEANUP_ACTION_NAME,
@@ -133,6 +144,11 @@ public class AsynchronousSearchManagementService extends AbstractLifecycleCompon
     }
 
     private void asyncCleanUpOperation(AsynchronousSearchCleanUpRequest request, Task task, ActionListener<AcknowledgedResponse> listener) {
+        if (standbyModeEnabled) {
+            logger.debug("cluster standby mode is enabled, skipping asynchronous search cleanup request [{}]", request);
+            listener.onResponse(new AcknowledgedResponse(true));
+            return;
+        }
         transportService.getThreadPool()
             .executor(AsynchronousSearchPlugin.OPEN_DISTRO_ASYNC_SEARCH_GENERIC_THREAD_POOL_NAME)
             .execute(() -> performPersistedResponseCleanUpAction(request, listener));
@@ -147,6 +163,11 @@ public class AsynchronousSearchManagementService extends AbstractLifecycleCompon
 
     @Override
     public void clusterChanged(ClusterChangedEvent event) {
+        if (standbyModeEnabled) {
+            logger.trace("cluster standby mode is enabled, skipping asynchronous search cleanup scheduling");
+            persistedResponseCleanUpRunnable.set(null);
+            return;
+        }
         if (event.localNodeClusterManager() && persistedResponseCleanUpRunnable.get() == null) {
             logger.trace("elected as cluster_manager, triggering response cleanup tasks");
             triggerCleanUp(event.state(), "became cluster_manager");
@@ -161,6 +182,10 @@ public class AsynchronousSearchManagementService extends AbstractLifecycleCompon
     }
 
     private void triggerCleanUp(ClusterState clusterState, String reason) {
+        if (standbyModeEnabled) {
+            logger.trace("cluster standby mode is enabled, skipping asynchronous search response cleanup trigger [{}]", reason);
+            return;
+        }
         if (clusterState.nodes().getDataNodes().size() > 0) {
             logger.debug("triggering response cleanup in background [{}]", reason);
             threadPool.executor(RESPONSE_CLEANUP_SCHEDULING_EXECUTOR).execute(new ResponseCleanUpRunnable(reason));
@@ -169,6 +194,10 @@ public class AsynchronousSearchManagementService extends AbstractLifecycleCompon
 
     @Override
     protected void doStart() {
+        if (standbyModeEnabled) {
+            logger.debug("cluster standby mode is enabled, skipping asynchronous search active context reaper scheduling");
+            return;
+        }
         activeContextReaperScheduledFuture = threadPool.scheduleWithFixedDelay(
             new ActiveContextReaper(),
             activeContextReaperInterval,
@@ -179,19 +208,27 @@ public class AsynchronousSearchManagementService extends AbstractLifecycleCompon
     @Override
     protected void doStop() {
         persistedResponseCleanUpRunnable.set(null);
-        activeContextReaperScheduledFuture.cancel();
+        if (activeContextReaperScheduledFuture != null) {
+            activeContextReaperScheduledFuture.cancel();
+        }
     }
 
     @Override
     protected void doClose() {
         persistedResponseCleanUpRunnable.set(null);
-        activeContextReaperScheduledFuture.cancel();
+        if (activeContextReaperScheduledFuture != null) {
+            activeContextReaperScheduledFuture.cancel();
+        }
     }
 
     class ActiveContextReaper implements Runnable {
 
         @Override
         public void run() {
+            if (standbyModeEnabled) {
+                logger.trace("cluster standby mode is enabled, skipping asynchronous search active context reaper run");
+                return;
+            }
             try {
                 Set<AsynchronousSearchContext> toFree = asynchronousSearchService.getContextsToReap();
                 // don't block on response
@@ -224,6 +261,10 @@ public class AsynchronousSearchManagementService extends AbstractLifecycleCompon
     }
 
     public final void performCleanUp() {
+        if (standbyModeEnabled) {
+            logger.trace("cluster standby mode is enabled, skipping asynchronous search response cleanup");
+            return;
+        }
         final ThreadContext threadContext = threadPool.getThreadContext();
         try (ThreadContext.StoredContext ignore = threadContext.stashContext()) {
             final Map<String, DiscoveryNode> dataNodes = clusterService.state().nodes().getDataNodes();
@@ -315,10 +356,20 @@ public class AsynchronousSearchManagementService extends AbstractLifecycleCompon
 
         @Override
         public void onAfter() {
-            if (this == persistedResponseCleanUpRunnable.get()) {
+            if (standbyModeEnabled) {
+                logger.trace("cluster standby mode is enabled, not rescheduling asynchronous search cleanup job");
+            } else if (this == persistedResponseCleanUpRunnable.get()) {
                 logger.trace("scheduling next clean up job in [{}]", persistedResponseCleanUpInterval);
                 threadPool.scheduleUnlessShuttingDown(persistedResponseCleanUpInterval, RESPONSE_CLEANUP_SCHEDULING_EXECUTOR, this);
             }
+        }
+    }
+
+    private void setStandbyModeEnabled(boolean standbyModeEnabled) {
+        logger.debug("updating cluster standby mode for asynchronous search management service to [{}]", standbyModeEnabled);
+        this.standbyModeEnabled = standbyModeEnabled;
+        if (standbyModeEnabled) {
+            persistedResponseCleanUpRunnable.set(null);
         }
     }
 

@@ -13,6 +13,7 @@ import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchSecurityException;
+import org.opensearch.OpenSearchStatusException;
 import org.opensearch.OpenSearchTimeoutException;
 import org.opensearch.ResourceNotFoundException;
 import org.opensearch.core.action.ActionListener;
@@ -80,6 +81,7 @@ import java.util.stream.Collectors;
 
 import static org.opensearch.core.action.ActionListener.runAfter;
 import static org.opensearch.core.action.ActionListener.wrap;
+import static org.opensearch.core.rest.RestStatus.SERVICE_UNAVAILABLE;
 import static org.opensearch.search.asynchronous.context.state.AsynchronousSearchState.CLOSED;
 import static org.opensearch.search.asynchronous.context.state.AsynchronousSearchState.FAILED;
 import static org.opensearch.search.asynchronous.context.state.AsynchronousSearchState.INIT;
@@ -205,6 +207,13 @@ public class AsynchronousSearchService extends AbstractLifecycleComponent implem
         Supplier<InternalAggregation.ReduceContextBuilder> reduceContextBuilder,
         User user
     ) {
+        if (persistenceService.isStandbyModeEnabled()) {
+            logger.debug("cluster standby mode is enabled, rejecting asynchronous search submission [{}]", request);
+            throw new OpenSearchStatusException(
+                "cluster standby mode is enabled, asynchronous search submissions are disabled",
+                SERVICE_UNAVAILABLE
+            );
+        }
         validateRequest(request);
         AsynchronousSearchContextId asynchronousSearchContextId = new AsynchronousSearchContextId(
             UUIDs.base64UUID(),
@@ -611,6 +620,11 @@ public class AsynchronousSearchService extends AbstractLifecycleComponent implem
     ) {
         ActionListener<AsynchronousSearchContext> exceptionTranslationWrapper = getExceptionTranslationWrapper(id, listener);
         validateKeepAlive(keepAlive);
+        if (persistenceService.isStandbyModeEnabled()) {
+            logger.debug("cluster standby mode is enabled, ignoring keep alive update for asynchronous search id [{}]", id);
+            findContext(id, asynchronousSearchContextId, user, listener);
+            return;
+        }
         long requestedExpirationTime = currentTimeSupplier.getAsLong() + keepAlive.getMillis();
         // find an active context on this node if one exists
         Optional<AsynchronousSearchActiveContext> asynchronousSearchContextOptional = asynchronousSearchActiveStore.getContext(
